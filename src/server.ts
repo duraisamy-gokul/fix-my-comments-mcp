@@ -1,7 +1,22 @@
 import { createInterface } from 'node:readline';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { join, basename } from 'node:path';
+import { randomUUID, createHash } from 'node:crypto';
+import { homedir } from 'node:os';
+import {
+  decodeTaskFile,
+  decodeMessageFile,
+  decodeHistoryFile,
+  decodeExecutionFile,
+} from './generated';
+import type {
+  TaskMessage,
+  AgentExecution,
+  TaskFile,
+  MessageFile,
+  HistoryFile,
+  ExecutionFile,
+} from './generated';
 
 const PROTOCOL_VERSION = '2024-11-05';
 const SERVER_NAME = 'fix-my-comments';
@@ -21,54 +36,10 @@ type JsonRpcResponse = {
   error?: { code: number; message: string };
 };
 
-type Task = {
-  id: string;
-  title: string;
-  description: string;
-  status: string;
-  anchor: { filePath: string; startLine: number; endLine: number };
-  threadHead: string;
-  threadTail: string;
-  messageCount: number;
-  updatedAt: string;
-};
-
-type Message = {
-  id: string;
-  taskId: string;
-  parentId: string | null;
-  seq: number;
-  authorType: string;
-  author: string;
-  content: string;
-  timestamp: string;
-};
-
-type HistoryEvent = {
-  id: string;
-  taskId: string;
-  seq: number;
-  type: string;
-  actor: string;
-  timestamp: string;
-};
-
-type AgentExecution = {
-  id: string;
-  messageId: string;
-  taskId: string;
-  agentId: string;
-  agentName: string;
-  timestamp: string;
-  summary: string;
-  reason: string | null;
-  filesChanged: string[] | null;
-};
-
-type TasksFile = { tasks: Task[] };
-type MessagesFile = { messages: Message[] };
-type HistoryFile = { schemaVersion: number; events: HistoryEvent[] };
-type ExecutionsFile = { schemaVersion: number; executions: AgentExecution[] };
+const EMPTY_TASKS: TaskFile = { schemaVersion: 1, tasks: [] };
+const EMPTY_MESSAGES: MessageFile = { schemaVersion: 1, messages: [] };
+const EMPTY_HISTORY: HistoryFile = { schemaVersion: 1, events: [] };
+const EMPTY_EXECUTIONS: ExecutionFile = { schemaVersion: 1, executions: [] };
 
 function send(msg: JsonRpcResponse): void {
   process.stdout.write(JSON.stringify(msg) + '\n');
@@ -82,7 +53,9 @@ function fail(id: string | number | null, code: number, message: string): void {
   send({ jsonrpc: '2.0', id, error: { code, message } });
 }
 
-function textResult(text: string): { content: { type: 'text'; text: string }[] } {
+function textResult(text: string): {
+  content: { type: 'text'; text: string }[];
+} {
   return { content: [{ type: 'text' as const, text }] };
 }
 
@@ -103,19 +76,46 @@ function readBranch(repoRoot: string): string {
   }
 }
 
+// Storage lives under ~/.fixmycomments (home root), laid out as
+// <repo-basename>-<shorthash>/<branch-with-dashes>. This MUST stay
+// byte-compatible with the extension's computeStoragePath in
+// fix-my-comments/src/storage/workspace-identity.ts.
+const STORAGE_ROOT = join(homedir(), '.fixmycomments');
+
 function getStoragePath(): string {
   const repoRoot = process.cwd();
   const branch = readBranch(repoRoot);
-  return join(repoRoot, '.fixmycomments', branch);
+  const repoFolder = `${basename(repoRoot)}-${createHash('sha1')
+    .update(repoRoot)
+    .digest('hex')
+    .slice(0, 8)}`;
+  const branchFolder = branch.replace(/\//g, '-');
+  return join(STORAGE_ROOT, repoFolder, branchFolder);
 }
 
-function readJson<T>(filePath: string, empty: T): T {
+function readJsonFile<T>(filePath: string, empty: T, decode: (raw: unknown) => T | null): T {
   try {
-    const parsed: T = JSON.parse(readFileSync(filePath, 'utf8'));
-    return parsed;
+    const parsed: unknown = JSON.parse(readFileSync(filePath, 'utf8'));
+    return decode(parsed) ?? empty;
   } catch {
     return empty;
   }
+}
+
+function readTasks(filePath: string): TaskFile {
+  return readJsonFile(filePath, EMPTY_TASKS, decodeTaskFile);
+}
+
+function readMessages(filePath: string): MessageFile {
+  return readJsonFile(filePath, EMPTY_MESSAGES, decodeMessageFile);
+}
+
+function readHistory(filePath: string): HistoryFile {
+  return readJsonFile(filePath, EMPTY_HISTORY, decodeHistoryFile);
+}
+
+function readExecutions(filePath: string): ExecutionFile {
+  return readJsonFile(filePath, EMPTY_EXECUTIONS, decodeExecutionFile);
 }
 
 function writeJson(filePath: string, data: unknown): void {
@@ -161,8 +161,14 @@ const TOOLS = [
           type: 'string',
           description: 'Machine identifier for this agent (e.g. claude-code).',
         },
-        agentName: { type: 'string', description: 'Human-readable agent name.' },
-        summary: { type: 'string', description: 'One-sentence summary of what was done.' },
+        agentName: {
+          type: 'string',
+          description: 'Human-readable agent name.',
+        },
+        summary: {
+          type: 'string',
+          description: 'One-sentence summary of what was done.',
+        },
         reason: { type: 'string', description: 'Why this action was taken.' },
         filesChanged: {
           type: 'array',
@@ -185,7 +191,10 @@ const TOOLS = [
           enum: ['resolved', 'requires_review'],
           description: 'New status.',
         },
-        reason: { type: 'string', description: 'Why the status is being changed.' },
+        reason: {
+          type: 'string',
+          description: 'Why the status is being changed.',
+        },
       },
       required: ['taskId', 'status'],
     },
@@ -203,7 +212,7 @@ function handleCall(id: string | number | null, name: string, args: Record<strin
 
   try {
     if (name === 'list_open_tasks') {
-      const file = readJson<TasksFile>(join(storagePath, 'tasks.json'), { tasks: [] });
+      const file = readTasks(join(storagePath, 'tasks.json'));
       let tasks = file.tasks.filter((t) => t.status === 'open');
       if (typeof args['filePath'] === 'string') {
         tasks = tasks.filter((t) => t.anchor.filePath === args['filePath']);
@@ -217,8 +226,7 @@ function handleCall(id: string | number | null, name: string, args: Record<strin
               title: t.title,
               description: t.description,
               filePath: t.anchor.filePath,
-              startLine: t.anchor.startLine,
-              endLine: t.anchor.endLine,
+              line: t.anchor.line,
               messageCount: t.messageCount,
               updatedAt: t.updatedAt,
             })),
@@ -236,15 +244,13 @@ function handleCall(id: string | number | null, name: string, args: Record<strin
         fail(id, -32602, 'taskId is required');
         return;
       }
-      const tasksFile = readJson<TasksFile>(join(storagePath, 'tasks.json'), { tasks: [] });
+      const tasksFile = readTasks(join(storagePath, 'tasks.json'));
       const task = tasksFile.tasks.find((t) => t.id === taskId);
       if (task == null) {
         fail(id, -32602, `Task ${taskId} not found`);
         return;
       }
-      const msgsFile = readJson<MessagesFile>(join(storagePath, 'messages.json'), {
-        messages: [],
-      });
+      const msgsFile = readMessages(join(storagePath, 'messages.json'));
       const messages = msgsFile.messages
         .filter((m) => m.taskId === taskId)
         .sort((a, b) => a.seq - b.seq);
@@ -265,7 +271,7 @@ function handleCall(id: string | number | null, name: string, args: Record<strin
         return;
       }
 
-      const tasksFile = readJson<TasksFile>(join(storagePath, 'tasks.json'), { tasks: [] });
+      const tasksFile = readTasks(join(storagePath, 'tasks.json'));
       const taskIdx = tasksFile.tasks.findIndex((t) => t.id === taskId);
       if (taskIdx === -1) {
         fail(id, -32602, `Task ${taskId} not found`);
@@ -273,16 +279,14 @@ function handleCall(id: string | number | null, name: string, args: Record<strin
       }
       const task = tasksFile.tasks[taskIdx];
 
-      const msgsFile = readJson<MessagesFile>(join(storagePath, 'messages.json'), {
-        messages: [],
-      });
+      const msgsFile = readMessages(join(storagePath, 'messages.json'));
       const taskMessages = msgsFile.messages.filter((m) => m.taskId === taskId);
       const seq = taskMessages.reduce((max, m) => Math.max(max, m.seq), 0) + 1;
       const parentId = task.threadTail.length > 0 ? task.threadTail : null;
       const now = new Date().toISOString();
       const messageId = `msg_${randomUUID()}`;
 
-      const message: Message = {
+      const message: TaskMessage = {
         id: messageId,
         taskId,
         parentId,
@@ -290,6 +294,8 @@ function handleCall(id: string | number | null, name: string, args: Record<strin
         authorType: 'ai',
         author: agentName,
         content,
+        messageType: 'comment',
+        suggestionCode: '',
         timestamp: now,
       };
 
@@ -316,10 +322,7 @@ function handleCall(id: string | number | null, name: string, args: Record<strin
         filesChanged: Array.isArray(filesChanged) ? filesChanged.map(String) : null,
       };
 
-      const execFile = readJson<ExecutionsFile>(join(storagePath, 'executions.json'), {
-        schemaVersion: 1,
-        executions: [],
-      });
+      const execFile = readExecutions(join(storagePath, 'executions.json'));
       execFile.executions.push(execution);
       writeJson(join(storagePath, 'executions.json'), execFile);
 
@@ -334,12 +337,14 @@ function handleCall(id: string | number | null, name: string, args: Record<strin
         fail(id, -32602, 'taskId and status are required');
         return;
       }
-      if (status !== 'resolved' && status !== 'requires_review') {
+      const ALLOWED_STATUSES = ['resolved', 'requires_review'] as const;
+      const allowed = ALLOWED_STATUSES.find((s) => s === status);
+      if (allowed == null) {
         fail(id, -32602, 'Agents may only set resolved or requires_review');
         return;
       }
 
-      const tasksFile = readJson<TasksFile>(join(storagePath, 'tasks.json'), { tasks: [] });
+      const tasksFile = readTasks(join(storagePath, 'tasks.json'));
       const taskIdx = tasksFile.tasks.findIndex((t) => t.id === taskId);
       if (taskIdx === -1) {
         fail(id, -32602, `Task ${taskId} not found`);
@@ -347,13 +352,14 @@ function handleCall(id: string | number | null, name: string, args: Record<strin
       }
 
       const now = new Date().toISOString();
-      tasksFile.tasks[taskIdx] = { ...tasksFile.tasks[taskIdx], status, updatedAt: now };
+      tasksFile.tasks[taskIdx] = {
+        ...tasksFile.tasks[taskIdx],
+        status: allowed,
+        updatedAt: now,
+      };
       writeJson(join(storagePath, 'tasks.json'), tasksFile);
 
-      const histFile = readJson<HistoryFile>(join(storagePath, 'history.json'), {
-        schemaVersion: 1,
-        events: [],
-      });
+      const histFile = readHistory(join(storagePath, 'history.json'));
       const taskEvents = histFile.events.filter((e) => e.taskId === taskId);
       const seq = taskEvents.reduce((max, e) => Math.max(max, e.seq), 0) + 1;
       const actor =
@@ -449,6 +455,10 @@ rl.on('line', (line) => {
     req = JSON.parse(trimmed);
     return dispatch(req);
   } catch {
-    send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
+    send({
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32700, message: 'Parse error' },
+    });
   }
 });

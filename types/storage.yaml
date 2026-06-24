@@ -1,0 +1,73 @@
+Storage:
+  WorkspaceIdentity:
+    description: Workspace identity derived from repo root and Git branch
+    type: object
+    required: [repoRoot, branch, storagePath]
+    properties:
+      repoRoot:
+        description: Absolute path to the repository root
+        type: string
+      branch:
+        description: Current Git branch name
+        type: string
+      storagePath:
+        description: >
+          Absolute path under ~/.fixmycomments where this repo+branch's data
+          lives. Shared verbatim with the fix-my-comments-mcp server.
+        type: string
+
+  TaskFile:
+    description: Root shape of the tasks.json storage file
+    type: object
+    required: [schemaVersion, tasks]
+    properties:
+      schemaVersion:
+        description: Storage schema version
+        type: number
+      tasks:
+        description: All tasks for this workspace and branch
+        type: array
+        items:
+          $ref: './types/task.yaml#/Task/Task'
+
+  MessageFile:
+    description: Root shape of the messages.json storage file
+    type: object
+    required: [schemaVersion, messages]
+    properties:
+      schemaVersion:
+        description: Storage schema version
+        type: number
+      messages:
+        description: All thread messages across tasks for this workspace and branch
+        type: array
+        items:
+          $ref: './types/task.yaml#/Task/TaskMessage'
+
+  HistoryFile:
+    description: Root shape of the history.json storage file
+    type: object
+    required: [schemaVersion, events]
+    properties:
+      schemaVersion:
+        description: Storage schema version
+        type: number
+      events:
+        description: All history events across tasks for this workspace and branch
+        type: array
+        items:
+          $ref: './types/task.yaml#/Task/TaskHistoryEvent'
+
+  ExecutionFile:
+    description: Root shape of the executions.json storage file
+    type: object
+    required: [schemaVersion, executions]
+    properties:
+      schemaVersion:
+        description: Storage schema version
+        type: number
+      executions:
+        description: All agent execution records for this workspace and branch
+        type: array
+        items:
+          $ref: './types/task.yaml#/Task/AgentExecution'

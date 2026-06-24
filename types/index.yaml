@@ -1,0 +1,9 @@
+info:
+  version: '1.0.0'
+  title: 'Fix My Comments Types'
+
+groupedTypes:
+  Task:
+    $ref: './types/task.yaml#/Task'
+  Storage:
+    $ref: './types/storage.yaml#/Storage'

@@ -1,0 +1,7 @@
+# Regenerate committed types when a spec exists, then keep them staged.
+if ls types/*.yaml >/dev/null 2>&1; then
+  npm run gen:types
+  git add src/generated
+fi
+
+npm run check

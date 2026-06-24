@@ -2,22 +2,41 @@
   "name": "fix-my-comments-mcp",
   "version": "1.0.0",
   "description": "MCP server for Fix My Comments — exposes code review tasks to AI agents via the Model Context Protocol.",
-  "keywords": ["mcp", "ai", "code-review", "comments", "tasks"],
+  "keywords": [
+    "mcp",
+    "ai",
+    "code-review",
+    "comments",
+    "tasks"
+  ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/duraisamy-gokul/fix-my-comments-mcp.git"
+  },
+  "homepage": "https://github.com/duraisamy-gokul/fix-my-comments-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/duraisamy-gokul/fix-my-comments-mcp/issues"
+  },
   "bin": {
     "fix-my-comments": "./dist/server.js"
   },
   "main": "./dist/server.js",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
-    "build": "node esbuild.js --production",
+    "clean": "rimraf dist out",
     "compile": "node esbuild.js",
     "watch": "node esbuild.js --watch",
     "check-types": "tsc --noEmit",
+    "build": "npm run check-types && node esbuild.js --production",
     "lint": "eslint -c eslint.config.mjs src",
+    "gen:types": "npx type-crafter generate typescript-with-decoders types/index.yaml src/generated SingleFile SingleFile && eslint --fix src/generated/ && prettier --write src/generated/",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "check": "npm run check-types && npm run lint && npm run format:check && npm run build",
+    "check": "npm run lint && npm run format:check && npm run build",
+    "prepare": "husky",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
@@ -26,9 +45,16 @@
     "esbuild": "^0.28.1",
     "eslint": "^9.39.4",
     "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-unused-imports": "^4.4.1",
     "globals": "^16.5.0",
+    "husky": "^9.1.7",
     "prettier": "^3.6.2",
+    "rimraf": "^6.0.1",
+    "type-crafter": "^0.13.4",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.61.1"
+  },
+  "dependencies": {
+    "type-decoder": "^2.3.1"
   }
 }
