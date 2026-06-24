@@ -4,10 +4,11 @@ MCP server for [Fix My Comments](https://github.com/fix-my-comments/fix-my-comme
 
 ## How it works
 
-The server reads task data from the `.fixmycomments/<branch>/` directory at the root of your Git repository. This directory is written by the **Fix My Comments** VS Code extension.
+The server reads task data from `~/.fixmycomments/<repo>-<hash>/<branch>/` (the home directory root, like `~/.claude/`). This directory is written by the **Fix My Comments** VS Code extension.
 
-- **Zero config** — the server auto-discovers the storage path based on `process.cwd()` and the current Git branch.
-- **Branch-scoped** — tasks are isolated per Git branch, matching VS Code workspace state.
+- **Zero config** — the server derives the storage path from `process.cwd()` (the repo root) and the current Git branch: `~/.fixmycomments/<repo-basename>-<shorthash>/<branch>/`.
+- **Repo + branch scoped** — tasks are isolated per repository and Git branch, matching VS Code workspace state.
+- **Shared with the extension** — the extension computes the same path, so both read/write the same data. Run the server from inside your repo so it resolves the correct repo + branch.
 
 ## Installation
 
@@ -36,12 +37,12 @@ claude mcp add fix-my-comments --scope user -- fix-my-comments
 
 ## Available Tools
 
-| Tool | Description |
-|------|-------------|
-| `list_open_tasks` | List all open tasks for the current branch. Optionally filter by file path. |
-| `get_task_thread` | Get a task and its full message thread. |
-| `post_agent_reply` | Append a reply to a task thread as an AI agent. |
-| `set_task_status` | Set a task status (`resolved` or `requires_review`). |
+| Tool               | Description                                                                 |
+| ------------------ | --------------------------------------------------------------------------- |
+| `list_open_tasks`  | List all open tasks for the current branch. Optionally filter by file path. |
+| `get_task_thread`  | Get a task and its full message thread.                                     |
+| `post_agent_reply` | Append a reply to a task thread as an AI agent.                             |
+| `set_task_status`  | Set a task status (`resolved` or `requires_review`).                        |
 
 ## Requirements
 
