@@ -10,6 +10,9 @@ import type {
   ReviewThread,
   ThreadFile,
   ReviewMessageFile,
+  ReplyInput,
+  StatusInput,
+  ThreadFetchResult,
 } from './generated';
 
 const PROTOCOL_VERSION = '2024-11-05';
@@ -181,6 +184,24 @@ function hashLine(lineText: string): string {
   return createNodeHash('sha256').update(lineText).digest('hex').slice(0, 16);
 }
 
+function asStringArray(value: unknown): string[] | null {
+  if (!Array.isArray(value) || !value.every((item) => typeof item === 'string')) {
+    return null;
+  }
+  return value;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== 'object' || value === null) {
+    return null;
+  }
+  const record: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    record[key] = item;
+  }
+  return record;
+}
+
 function markOutdatedThreads(storagePath: string, threadsFile: ThreadFile): boolean {
   let changed = false;
   for (const thread of threadsFile.threads) {
@@ -213,11 +234,71 @@ function markOutdatedThreads(storagePath: string, threadsFile: ThreadFile): bool
   return changed;
 }
 
+function buildThreadFetchResult(
+  thread: ReviewThread,
+  msgsFile: ReviewMessageFile,
+  messageLimitArg: unknown,
+): ThreadFetchResult {
+  const allMessages = sortedThreadMessages(msgsFile, thread.id);
+  const messageLimit = clampInteger(messageLimitArg, allMessages.length, 1, 500);
+  const messages = allMessages.slice(-messageLimit);
+  return {
+    thread,
+    messages,
+    totalMessages: allMessages.length,
+    returnedMessages: messages.length,
+  };
+}
+
+function parseReplyInput(
+  raw: Record<string, unknown>,
+  defaults: Record<string, unknown>,
+): ReplyInput | null {
+  const threadId = raw['threadId'];
+  const content = raw['content'];
+  if (typeof threadId !== 'string' || typeof content !== 'string') {
+    return null;
+  }
+  const replyToMessageId = raw['replyToMessageId'];
+  const agentId = raw['agentId'] ?? defaults['agentId'];
+  const agentName = raw['agentName'] ?? defaults['agentName'];
+  const summary = raw['summary'] ?? defaults['summary'];
+  const suggestionCode = raw['suggestionCode'];
+  const originalCode = raw['originalCode'];
+  return {
+    threadId,
+    replyToMessageId: typeof replyToMessageId === 'string' ? replyToMessageId : null,
+    content,
+    agentId: typeof agentId === 'string' ? agentId : null,
+    agentName: typeof agentName === 'string' ? agentName : null,
+    summary: typeof summary === 'string' ? summary : null,
+    suggestionCode: typeof suggestionCode === 'string' ? suggestionCode : null,
+    originalCode: typeof originalCode === 'string' ? originalCode : null,
+  };
+}
+
+function parseStatusInput(
+  raw: Record<string, unknown>,
+  defaults: Record<string, unknown>,
+): StatusInput | null {
+  const threadId = raw['threadId'];
+  const status = raw['status'] ?? defaults['status'];
+  if (typeof threadId !== 'string' || (status !== 'resolved' && status !== 'open')) {
+    return null;
+  }
+  const reason = raw['reason'] ?? defaults['reason'];
+  return {
+    threadId,
+    status,
+    reason: typeof reason === 'string' ? reason : null,
+  };
+}
+
 const TOOLS = [
   {
     name: 'list_open_threads',
     description:
-      'List open, non-outdated Fix My Comments threads for the current workspace and branch. Optionally filter by file path. Set includeOutdated=true only when you intentionally want stale anchor comments.',
+      'Call this once first to discover actionable Fix My Comments threads. Lists open, non-outdated threads for the current workspace and branch with messageCount. Optionally filter by file path. Do not call get_thread for every thread unless you need that thread content. Set includeOutdated=true only when intentionally inspecting stale anchor comments.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -240,11 +321,17 @@ const TOOLS = [
   {
     name: 'get_thread',
     description:
-      'Get a thread plus its messages in chronological order. Use messageLimit for a smaller tail instead of loading the whole thread.',
+      'Read actionable thread content before editing or replying. Supports single fetch via threadId and bulk fetch via threadIds. Prefer list_open_threads first, and only fetch threads you will actually address. Use messageLimit for a smaller tail instead of loading full long threads.',
     inputSchema: {
       type: 'object',
       properties: {
-        threadId: { type: 'string', description: 'The thread id.' },
+        threadId: { type: 'string', description: 'The thread id for a single fetch.' },
+        threadIds: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Thread ids for bulk fetch. Use instead of threadId when fetching multiple addressed threads.',
+        },
         messageLimit: {
           type: 'number',
           description: 'Optional maximum number of latest messages to return.',
@@ -254,13 +341,12 @@ const TOOLS = [
           description: 'Allow reading an outdated/stale thread. Defaults to false.',
         },
       },
-      required: ['threadId'],
     },
   },
   {
     name: 'get_message',
     description:
-      'Get one comment/message by id, including its thread summary and position. Use this instead of get_thread when only one message is needed.',
+      'Optional edge-case tool. Use only when the user or another tool gives you a direct messageId and you need just that one message. Do not use for normal thread discovery.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -276,7 +362,7 @@ const TOOLS = [
   {
     name: 'get_message_context',
     description:
-      'Get one message plus a small context window from the same thread, so agents do not waste tokens loading an entire long thread.',
+      'Optional edge-case tool. Use only when you already have a messageId and the thread is long; fetches nearby messages instead of the full thread to save tokens. Do not use for normal thread discovery.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -300,7 +386,7 @@ const TOOLS = [
   {
     name: 'post_agent_reply',
     description:
-      'Append a reply to a thread as an AI agent. Rejected if the thread is resolved or outdated. A reply that fixes code can optionally include a suggestion.',
+      'Append concise AI replies after addressing comments. Supports a single reply with threadId/content or bulk replies with replies[]. Use once per addressed thread to explain what was fixed. Rejected if a target thread is resolved or outdated. Replies that fix code can optionally include suggestions.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -318,6 +404,25 @@ const TOOLS = [
           type: 'string',
           description: 'Human-readable agent name.',
         },
+        replies: {
+          type: 'array',
+          description:
+            'Bulk replies. Each item accepts threadId, content, optional replyToMessageId, summary, suggestionCode, originalCode, agentId, and agentName.',
+          items: {
+            type: 'object',
+            properties: {
+              threadId: { type: 'string' },
+              replyToMessageId: { type: 'string' },
+              content: { type: 'string' },
+              summary: { type: 'string' },
+              suggestionCode: { type: 'string' },
+              originalCode: { type: 'string' },
+              agentId: { type: 'string' },
+              agentName: { type: 'string' },
+            },
+            required: ['threadId', 'content'],
+          },
+        },
         summary: {
           type: 'string',
           description: 'One-sentence summary of what was done.',
@@ -332,17 +437,36 @@ const TOOLS = [
             'The original code the suggestion replaces (required if suggestionCode is set).',
         },
       },
-      required: ['threadId', 'content', 'agentId', 'agentName', 'summary'],
+      required: [],
     },
   },
   {
     name: 'set_thread_status',
     description:
-      'Set a thread resolved or reopen it. Agents may mark a thread resolved once they have addressed it, or reopen to continue work.',
+      'Resolve or reopen a thread. Only call after fixing/responding when the user wants addressed threads marked resolved, or when explicitly reopening a resolved thread before replying.',
     inputSchema: {
       type: 'object',
       properties: {
-        threadId: { type: 'string', description: 'The thread id.' },
+        threadId: { type: 'string', description: 'The thread id for a single status update.' },
+        threadIds: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Thread ids for bulk status update. Uses the top-level status/reason.',
+        },
+        updates: {
+          type: 'array',
+          description:
+            'Bulk status updates. Each item accepts threadId, status, and optional reason.',
+          items: {
+            type: 'object',
+            properties: {
+              threadId: { type: 'string' },
+              status: { type: 'string', enum: ['resolved', 'open'] },
+              reason: { type: 'string' },
+            },
+            required: ['threadId'],
+          },
+        },
         status: {
           type: 'string',
           enum: ['resolved', 'open'],
@@ -355,7 +479,7 @@ const TOOLS = [
         agentId: { type: 'string', description: 'Machine identifier for this agent.' },
         agentName: { type: 'string', description: 'Human-readable agent name.' },
       },
-      required: ['threadId', 'status'],
+      required: [],
     },
   },
   {
@@ -373,7 +497,8 @@ const TOOLS = [
   },
   {
     name: 'add_reaction',
-    description: 'Add an emoji reaction to a specific message in a thread as an AI agent.',
+    description:
+      'Add an emoji reaction to a specific message. Optional: only call when the user asks for reactions or reactions are part of the agreed workflow.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -446,39 +571,42 @@ function handleCall(id: string | number | null, name: string, args: Record<strin
 
     if (name === 'get_thread') {
       const threadId = args['threadId'];
-      if (typeof threadId !== 'string') {
-        fail(id, -32602, 'threadId is required');
+      const threadIdsArg = args['threadIds'];
+      const threadIdsBulk = asStringArray(threadIdsArg);
+      const threadIds = threadIdsBulk ?? (typeof threadId === 'string' ? [threadId] : []);
+      if (threadIds.length === 0) {
+        fail(id, -32602, 'threadId or threadIds is required');
         return;
       }
+
       const threadsFile = readThreads(join(storagePath, 'threads.json'));
       markOutdatedThreads(storagePath, threadsFile);
-      const thread = findThread(threadsFile, threadId);
-      if (thread == null) {
-        fail(id, -32602, `Thread ${threadId} not found`);
-        return;
-      }
-      if (thread.status.outdated && args['includeOutdated'] !== true) {
-        fail(
-          id,
-          -32602,
-          `Thread ${threadId} is outdated because its anchor line changed. Use includeOutdated=true only to inspect stale comments, not to act on them.`,
-        );
-        return;
-      }
       const msgsFile = readMessages(join(storagePath, 'messages.json'));
-      const allMessages = sortedThreadMessages(msgsFile, threadId);
-      const messageLimit = clampInteger(args['messageLimit'], allMessages.length, 1, 500);
-      const messages = allMessages.slice(-messageLimit);
+      const results: ThreadFetchResult[] = [];
+      for (const idToFetch of threadIds) {
+        const thread = findThread(threadsFile, idToFetch);
+        if (thread == null) {
+          fail(id, -32602, `Thread ${idToFetch} not found`);
+          return;
+        }
+        if (thread.status.outdated && args['includeOutdated'] !== true) {
+          fail(
+            id,
+            -32602,
+            `Thread ${idToFetch} is outdated because its anchor line changed. Use includeOutdated=true only to inspect stale comments, not to act on them.`,
+          );
+          return;
+        }
+        results.push(buildThreadFetchResult(thread, msgsFile, args['messageLimit']));
+      }
+
       ok(
         id,
         textResult(
           JSON.stringify(
-            {
-              thread,
-              messages,
-              totalMessages: allMessages.length,
-              returnedMessages: messages.length,
-            },
+            typeof threadId === 'string' && threadIdsBulk == null
+              ? results[0]
+              : { threads: results, requested: threadIds.length, returned: results.length },
             null,
             2,
           ),
@@ -588,126 +716,155 @@ function handleCall(id: string | number | null, name: string, args: Record<strin
     }
 
     if (name === 'post_agent_reply') {
-      const {
-        threadId,
-        replyToMessageId,
-        content,
-        agentId,
-        agentName,
-        summary,
-        suggestionCode,
-        originalCode,
-      } = args;
-      if (
-        typeof threadId !== 'string' ||
-        typeof content !== 'string' ||
-        typeof agentId !== 'string' ||
-        typeof agentName !== 'string' ||
-        typeof summary !== 'string'
-      ) {
-        fail(id, -32602, 'threadId, content, agentId, agentName, summary are required');
+      const rawReplies = args['replies'];
+      const replyInputs = Array.isArray(rawReplies)
+        ? rawReplies.map((reply) => {
+            const replyRecord = asRecord(reply);
+            return replyRecord == null ? null : parseReplyInput(replyRecord, args);
+          })
+        : [parseReplyInput(args, args)];
+
+      if (replyInputs.length === 0 || replyInputs.some((reply) => reply == null)) {
+        fail(id, -32602, 'Provide threadId/content or replies[] with threadId/content');
         return;
       }
 
-      const threadsFile = readThreads(join(storagePath, 'threads.json'));
-      markOutdatedThreads(storagePath, threadsFile);
-      const threadIdx = threadsFile.threads.findIndex((t) => t.id === threadId);
-      if (threadIdx === -1) {
-        fail(id, -32602, `Thread ${threadId} not found`);
-        return;
-      }
-      const thread = threadsFile.threads[threadIdx];
-
-      // Enforce: resolved and outdated threads are locked from agent replies.
-      if (thread.status.resolved) {
-        fail(id, -32602, `Thread ${threadId} is resolved. Reopen it with set_thread_status first.`);
-        return;
-      }
-      if (thread.status.outdated) {
-        fail(
-          id,
-          -32602,
-          `Thread ${threadId} is outdated because its anchor line changed. Ask the user to refresh or recreate the comment before replying.`,
-        );
-        return;
-      }
-
-      const msgsFile = readMessages(join(storagePath, 'messages.json'));
-      if (typeof replyToMessageId === 'string') {
-        const replyTarget = msgsFile.messages.find(
-          (m) => m.id === replyToMessageId && m.threadId === threadId,
-        );
-        if (replyTarget == null) {
-          fail(id, -32602, `Reply target ${replyToMessageId} not found in thread ${threadId}`);
-          return;
+      const replies: ReplyInput[] = [];
+      for (const reply of replyInputs) {
+        if (reply != null) {
+          replies.push(reply);
         }
       }
-
-      const author: Author = { type: 'ai', id: agentId, name: agentName };
+      const threadsFile = readThreads(join(storagePath, 'threads.json'));
+      markOutdatedThreads(storagePath, threadsFile);
+      const msgsFile = readMessages(join(storagePath, 'messages.json'));
       const now = new Date().toISOString();
-      const messageId = `msg_${randomUUID()}`;
-      const suggestionText =
-        typeof suggestionCode === 'string' && suggestionCode.length > 0 ? suggestionCode : null;
-      const hasSuggestion = suggestionText != null;
+      const posted: object[] = [];
 
-      const message: ReviewMessage = {
-        id: messageId,
-        threadId,
-        author,
-        type: hasSuggestion ? 'suggestion' : 'comment',
-        content: { markdown: appendReplyPrefix(content, replyToMessageId) },
-        suggestion: hasSuggestion
-          ? {
-              originalCode: typeof originalCode === 'string' ? originalCode : '',
-              suggestedCode: suggestionText,
-              applied: false,
-              appliedBy: null,
-              appliedAt: null,
-            }
-          : null,
-        task: null,
-        reactions: {},
-        metadata: { createdAt: now, updatedAt: now, editedAt: null },
-      };
+      for (const reply of replies) {
+        const threadIdx = threadsFile.threads.findIndex((t) => t.id === reply.threadId);
+        if (threadIdx === -1) {
+          fail(id, -32602, `Thread ${reply.threadId} not found`);
+          return;
+        }
+        const thread = threadsFile.threads[threadIdx];
 
-      msgsFile.messages.push(message);
+        // Enforce: resolved and outdated threads are locked from agent replies.
+        if (thread.status.resolved) {
+          fail(
+            id,
+            -32602,
+            `Thread ${reply.threadId} is resolved. Reopen it with set_thread_status first.`,
+          );
+          return;
+        }
+        if (thread.status.outdated) {
+          fail(
+            id,
+            -32602,
+            `Thread ${reply.threadId} is outdated because its anchor line changed. Ask the user to refresh or recreate the comment before replying.`,
+          );
+          return;
+        }
+
+        if (typeof reply.replyToMessageId === 'string') {
+          const replyTarget = msgsFile.messages.find(
+            (m) => m.id === reply.replyToMessageId && m.threadId === reply.threadId,
+          );
+          if (replyTarget == null) {
+            fail(
+              id,
+              -32602,
+              `Reply target ${reply.replyToMessageId} not found in thread ${reply.threadId}`,
+            );
+            return;
+          }
+        }
+
+        const agentId = reply.agentId ?? 'agent';
+        const agentName = reply.agentName ?? 'AI Agent';
+        const summary = reply.summary ?? reply.content.split(/\r?\n/, 1)[0] ?? '';
+        const author: Author = { type: 'ai', id: agentId, name: agentName };
+        const messageId = `msg_${randomUUID()}`;
+        const suggestionText =
+          typeof reply.suggestionCode === 'string' && reply.suggestionCode.length > 0
+            ? reply.suggestionCode
+            : null;
+        const hasSuggestion = suggestionText != null;
+
+        const message: ReviewMessage = {
+          id: messageId,
+          threadId: reply.threadId,
+          author,
+          type: hasSuggestion ? 'suggestion' : 'comment',
+          content: { markdown: appendReplyPrefix(reply.content, reply.replyToMessageId) },
+          suggestion: hasSuggestion
+            ? {
+                originalCode: typeof reply.originalCode === 'string' ? reply.originalCode : '',
+                suggestedCode: suggestionText,
+                applied: false,
+                appliedBy: null,
+                appliedAt: null,
+              }
+            : null,
+          task: null,
+          reactions: {},
+          metadata: { createdAt: now, updatedAt: now, editedAt: null },
+        };
+
+        msgsFile.messages.push(message);
+        threadsFile.threads[threadIdx] = {
+          ...thread,
+          metadata: { ...thread.metadata, updatedAt: now },
+        };
+        posted.push({ messageId, threadId: reply.threadId, summary, type: message.type });
+      }
+
       writeJson(join(storagePath, 'messages.json'), msgsFile);
-
-      threadsFile.threads[threadIdx] = {
-        ...thread,
-        metadata: { ...thread.metadata, updatedAt: now },
-      };
       writeJson(join(storagePath, 'threads.json'), threadsFile);
 
       ok(
         id,
-        textResult(JSON.stringify({ messageId, threadId, summary, type: message.type }, null, 2)),
+        textResult(
+          JSON.stringify(
+            Array.isArray(rawReplies)
+              ? { replies: posted, requested: replies.length, posted: posted.length }
+              : posted[0],
+            null,
+            2,
+          ),
+        ),
       );
       return;
     }
 
     if (name === 'set_thread_status') {
-      const threadId = args['threadId'];
-      const status = args['status'];
-      if (typeof threadId !== 'string' || typeof status !== 'string') {
-        fail(id, -32602, 'threadId and status are required');
+      const rawUpdates = args['updates'];
+      const threadIdsArg = args['threadIds'];
+      const statusThreadIds = asStringArray(threadIdsArg);
+      const statusInputs = Array.isArray(rawUpdates)
+        ? rawUpdates.map((update) => {
+            const updateRecord = asRecord(update);
+            return updateRecord == null ? null : parseStatusInput(updateRecord, args);
+          })
+        : statusThreadIds != null
+          ? statusThreadIds.map((threadId) => parseStatusInput({ threadId }, args))
+          : [parseStatusInput(args, args)];
+
+      if (statusInputs.length === 0 || statusInputs.some((update) => update == null)) {
+        fail(id, -32602, 'Provide threadId/status, threadIds[] with status, or updates[]');
         return;
       }
-      const isResolved = status === 'resolved';
-      const isOpen = status === 'open';
-      if (!isResolved && !isOpen) {
-        fail(id, -32602, 'status must be resolved or open');
-        return;
+
+      const updates: StatusInput[] = [];
+      for (const update of statusInputs) {
+        if (update != null) {
+          updates.push(update);
+        }
       }
 
       const threadsFile = readThreads(join(storagePath, 'threads.json'));
       markOutdatedThreads(storagePath, threadsFile);
-      const threadIdx = threadsFile.threads.findIndex((t) => t.id === threadId);
-      if (threadIdx === -1) {
-        fail(id, -32602, `Thread ${threadId} not found`);
-        return;
-      }
-
       const now = new Date().toISOString();
       const actor =
         typeof args['agentId'] === 'string'
@@ -715,28 +872,54 @@ function handleCall(id: string | number | null, name: string, args: Record<strin
           : typeof args['agentName'] === 'string'
             ? args['agentName']
             : 'agent';
-      const reason = typeof args['reason'] === 'string' ? args['reason'] : null;
+      const changed: object[] = [];
 
-      threadsFile.threads[threadIdx] = {
-        ...threadsFile.threads[threadIdx],
-        status: isResolved
-          ? {
-              ...threadsFile.threads[threadIdx].status,
-              resolved: true,
-              resolvedBy: actor,
-              resolvedAt: now,
-            }
-          : {
-              ...threadsFile.threads[threadIdx].status,
-              resolved: false,
-              resolvedBy: null,
-              resolvedAt: null,
-            },
-        metadata: { ...threadsFile.threads[threadIdx].metadata, updatedAt: now },
-      };
+      for (const update of updates) {
+        const threadIdx = threadsFile.threads.findIndex((t) => t.id === update.threadId);
+        if (threadIdx === -1) {
+          fail(id, -32602, `Thread ${update.threadId} not found`);
+          return;
+        }
+
+        const isResolved = update.status === 'resolved';
+        threadsFile.threads[threadIdx] = {
+          ...threadsFile.threads[threadIdx],
+          status: isResolved
+            ? {
+                ...threadsFile.threads[threadIdx].status,
+                resolved: true,
+                resolvedBy: actor,
+                resolvedAt: now,
+              }
+            : {
+                ...threadsFile.threads[threadIdx].status,
+                resolved: false,
+                resolvedBy: null,
+                resolvedAt: null,
+              },
+          metadata: { ...threadsFile.threads[threadIdx].metadata, updatedAt: now },
+        };
+        changed.push({
+          threadId: update.threadId,
+          status: update.status,
+          reason: update.reason ?? null,
+        });
+      }
+
       writeJson(join(storagePath, 'threads.json'), threadsFile);
 
-      ok(id, textResult(JSON.stringify({ threadId, status, reason }, null, 2)));
+      ok(
+        id,
+        textResult(
+          JSON.stringify(
+            Array.isArray(rawUpdates) || statusThreadIds != null
+              ? { updates: changed, requested: updates.length, updated: changed.length }
+              : changed[0],
+            null,
+            2,
+          ),
+        ),
+      );
       return;
     }
 
