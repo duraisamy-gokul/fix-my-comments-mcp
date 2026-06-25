@@ -1,6 +1,6 @@
 {
   "name": "fix-my-comments-mcp",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "MCP server for Fix My Comments — exposes code review tasks to AI agents via the Model Context Protocol.",
   "keywords": [
     "mcp",
