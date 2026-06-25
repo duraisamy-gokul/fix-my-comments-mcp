@@ -7,3 +7,5 @@ groupedTypes:
     $ref: './types/task.yaml#/Task'
   Storage:
     $ref: './types/storage.yaml#/Storage'
+  Server:
+    $ref: './types/server.yaml#/Server'
