@@ -1,26 +1,20 @@
 import { createInterface } from 'node:readline';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join, basename } from 'node:path';
-import { randomUUID, createHash } from 'node:crypto';
+import { randomUUID, createHash as createNodeHash } from 'node:crypto';
 import { homedir } from 'node:os';
-import {
-  decodeTaskFile,
-  decodeMessageFile,
-  decodeHistoryFile,
-  decodeExecutionFile,
-} from './generated';
+import { decodeThreadFile, decodeReviewMessageFile } from './generated';
 import type {
-  TaskMessage,
-  AgentExecution,
-  TaskFile,
-  MessageFile,
-  HistoryFile,
-  ExecutionFile,
+  Author,
+  ReviewMessage,
+  ReviewThread,
+  ThreadFile,
+  ReviewMessageFile,
 } from './generated';
 
 const PROTOCOL_VERSION = '2024-11-05';
 const SERVER_NAME = 'fix-my-comments';
-const SERVER_VERSION = '1.0.0';
+const SERVER_VERSION = '2.0.0';
 
 type JsonRpcRequest = {
   jsonrpc: '2.0';
@@ -36,10 +30,8 @@ type JsonRpcResponse = {
   error?: { code: number; message: string };
 };
 
-const EMPTY_TASKS: TaskFile = { schemaVersion: 1, tasks: [] };
-const EMPTY_MESSAGES: MessageFile = { schemaVersion: 1, messages: [] };
-const EMPTY_HISTORY: HistoryFile = { schemaVersion: 1, events: [] };
-const EMPTY_EXECUTIONS: ExecutionFile = { schemaVersion: 1, executions: [] };
+const EMPTY_THREADS: ThreadFile = { schemaVersion: 1, threads: [] };
+const EMPTY_MESSAGES: ReviewMessageFile = { schemaVersion: 1, messages: [] };
 
 function send(msg: JsonRpcResponse): void {
   process.stdout.write(JSON.stringify(msg) + '\n');
@@ -76,19 +68,25 @@ function readBranch(repoRoot: string): string {
   }
 }
 
-// Storage lives under ~/.fixmycomments (home root), laid out as
-// <repo-basename>-<shorthash>/<branch-with-dashes>. This MUST stay
+// Storage lives under ~/.fixmycomments (home root). This MUST stay
 // byte-compatible with the extension's computeStoragePath in
 // fix-my-comments/src/storage/workspace-identity.ts.
+//
+// - Git repo: <repo-basename>-<shorthash>/<branch-with-dashes>/  (per branch)
+// - Non-git:  <folder-basename>-<shorthash>/                     (no branch seg)
 const STORAGE_ROOT = join(homedir(), '.fixmycomments');
+const NO_GIT_BRANCH = 'no-git';
 
 function getStoragePath(): string {
   const repoRoot = process.cwd();
   const branch = readBranch(repoRoot);
-  const repoFolder = `${basename(repoRoot)}-${createHash('sha1')
+  const repoFolder = `${basename(repoRoot)}-${createNodeHash('sha1')
     .update(repoRoot)
     .digest('hex')
     .slice(0, 8)}`;
+  if (branch === NO_GIT_BRANCH) {
+    return join(STORAGE_ROOT, repoFolder);
+  }
   const branchFolder = branch.replace(/\//g, '-');
   return join(STORAGE_ROOT, repoFolder, branchFolder);
 }
@@ -102,20 +100,12 @@ function readJsonFile<T>(filePath: string, empty: T, decode: (raw: unknown) => T
   }
 }
 
-function readTasks(filePath: string): TaskFile {
-  return readJsonFile(filePath, EMPTY_TASKS, decodeTaskFile);
+function readThreads(filePath: string): ThreadFile {
+  return readJsonFile(filePath, EMPTY_THREADS, decodeThreadFile);
 }
 
-function readMessages(filePath: string): MessageFile {
-  return readJsonFile(filePath, EMPTY_MESSAGES, decodeMessageFile);
-}
-
-function readHistory(filePath: string): HistoryFile {
-  return readJsonFile(filePath, EMPTY_HISTORY, decodeHistoryFile);
-}
-
-function readExecutions(filePath: string): ExecutionFile {
-  return readJsonFile(filePath, EMPTY_EXECUTIONS, decodeExecutionFile);
+function readMessages(filePath: string): ReviewMessageFile {
+  return readJsonFile(filePath, EMPTY_MESSAGES, decodeReviewMessageFile);
 }
 
 function writeJson(filePath: string, data: unknown): void {
@@ -123,11 +113,111 @@ function writeJson(filePath: string, data: unknown): void {
   writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
 }
 
+function clampInteger(value: unknown, fallback: number, min: number, max: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return fallback;
+  }
+  return Math.max(min, Math.min(max, Math.trunc(value)));
+}
+
+function sortedThreadMessages(messages: ReviewMessageFile, threadId: string): ReviewMessage[] {
+  return messages.messages
+    .filter((m) => m.threadId === threadId)
+    .sort((a, b) => a.metadata.createdAt.localeCompare(b.metadata.createdAt));
+}
+
+function findThread(threads: ThreadFile, threadId: string): ReviewThread | null {
+  return threads.threads.find((t) => t.id === threadId) ?? null;
+}
+
+function findMessage(
+  messages: ReviewMessageFile,
+  messageId: string,
+): { message: ReviewMessage; index: number } | null {
+  const index = messages.messages.findIndex((m) => m.id === messageId);
+  if (index === -1) {
+    return null;
+  }
+  return { message: messages.messages[index], index };
+}
+
+function messageSummary(message: ReviewMessage): object {
+  return {
+    id: message.id,
+    threadId: message.threadId,
+    author: message.author,
+    type: message.type,
+    markdown: message.content.markdown,
+    suggestion: message.suggestion,
+    task: message.task,
+    reactions: message.reactions,
+    createdAt: message.metadata.createdAt,
+    updatedAt: message.metadata.updatedAt,
+  };
+}
+
+function threadSummary(thread: ReviewThread, messageCount: number): object {
+  return {
+    id: thread.id,
+    filePath: thread.anchor.filePath,
+    line: thread.anchor.line,
+    type: thread.anchor.type,
+    snippet: thread.anchor.snippet,
+    resolved: thread.status.resolved,
+    outdated: thread.status.outdated,
+    messageCount,
+    updatedAt: thread.metadata.updatedAt,
+  };
+}
+
+function appendReplyPrefix(content: string, replyToMessageId: unknown): string {
+  if (typeof replyToMessageId !== 'string' || replyToMessageId.length === 0) {
+    return content;
+  }
+  return `↳ Reply to ${replyToMessageId}\n\n${content}`;
+}
+
+function hashLine(lineText: string): string {
+  return createNodeHash('sha256').update(lineText).digest('hex').slice(0, 16);
+}
+
+function markOutdatedThreads(storagePath: string, threadsFile: ThreadFile): boolean {
+  let changed = false;
+  for (const thread of threadsFile.threads) {
+    if (
+      thread.anchor.type !== 'line' ||
+      thread.anchor.line == null ||
+      thread.anchor.lineHash === ''
+    ) {
+      continue;
+    }
+    try {
+      const file = readFileSync(join(process.cwd(), thread.anchor.filePath), 'utf8');
+      const lineText = file.split(/\r?\n/)[thread.anchor.line];
+      if (lineText == null) {
+        continue;
+      }
+      const outdated = hashLine(lineText) !== thread.anchor.lineHash;
+      if (thread.status.outdated !== outdated) {
+        thread.status = { ...thread.status, outdated };
+        thread.metadata = { ...thread.metadata, updatedAt: new Date().toISOString() };
+        changed = true;
+      }
+    } catch {
+      // If the workspace file cannot be read, keep the stored status unchanged.
+    }
+  }
+  if (changed) {
+    writeJson(join(storagePath, 'threads.json'), threadsFile);
+  }
+  return changed;
+}
+
 const TOOLS = [
   {
-    name: 'list_open_tasks',
+    name: 'list_open_threads',
     description:
-      'List all open Fix My Comments tasks for the current workspace and branch. Optionally filter by file path.',
+      'List open, non-outdated Fix My Comments threads for the current workspace and branch. Optionally filter by file path. Set includeOutdated=true only when you intentionally want stale anchor comments.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -135,28 +225,91 @@ const TOOLS = [
           type: 'string',
           description: 'Workspace-relative file path to filter by (optional).',
         },
+        includeOutdated: {
+          type: 'boolean',
+          description:
+            'Include outdated/stale threads. Defaults to false so agents avoid stale comments.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of threads to return. Defaults to all matching threads.',
+        },
       },
     },
   },
   {
-    name: 'get_task_thread',
-    description: 'Get a task and its full message thread in chronological order.',
+    name: 'get_thread',
+    description:
+      'Get a thread plus its messages in chronological order. Use messageLimit for a smaller tail instead of loading the whole thread.',
     inputSchema: {
       type: 'object',
       properties: {
-        taskId: { type: 'string', description: 'The task id.' },
+        threadId: { type: 'string', description: 'The thread id.' },
+        messageLimit: {
+          type: 'number',
+          description: 'Optional maximum number of latest messages to return.',
+        },
+        includeOutdated: {
+          type: 'boolean',
+          description: 'Allow reading an outdated/stale thread. Defaults to false.',
+        },
       },
-      required: ['taskId'],
+      required: ['threadId'],
+    },
+  },
+  {
+    name: 'get_message',
+    description:
+      'Get one comment/message by id, including its thread summary and position. Use this instead of get_thread when only one message is needed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        messageId: { type: 'string', description: 'The message id.' },
+        includeOutdated: {
+          type: 'boolean',
+          description: 'Allow reading a message from an outdated/stale thread. Defaults to false.',
+        },
+      },
+      required: ['messageId'],
+    },
+  },
+  {
+    name: 'get_message_context',
+    description:
+      'Get one message plus a small context window from the same thread, so agents do not waste tokens loading an entire long thread.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        messageId: { type: 'string', description: 'The center message id.' },
+        before: {
+          type: 'number',
+          description: 'How many messages before the target to include. Defaults to 5.',
+        },
+        after: {
+          type: 'number',
+          description: 'How many messages after the target to include. Defaults to 0.',
+        },
+        includeOutdated: {
+          type: 'boolean',
+          description: 'Allow reading context from an outdated/stale thread. Defaults to false.',
+        },
+      },
+      required: ['messageId'],
     },
   },
   {
     name: 'post_agent_reply',
-    description: 'Append a reply to a task thread as an AI agent and record execution metadata.',
+    description:
+      'Append a reply to a thread as an AI agent. Rejected if the thread is resolved or outdated. A reply that fixes code can optionally include a suggestion.',
     inputSchema: {
       type: 'object',
       properties: {
-        taskId: { type: 'string', description: 'Task id to reply to.' },
-        content: { type: 'string', description: 'Reply message body.' },
+        threadId: { type: 'string', description: 'Thread id to reply to.' },
+        replyToMessageId: {
+          type: 'string',
+          description: 'Optional message id this flat reply is responding to.',
+        },
+        content: { type: 'string', description: 'Reply message body (markdown).' },
         agentId: {
           type: 'string',
           description: 'Machine identifier for this agent (e.g. claude-code).',
@@ -169,34 +322,79 @@ const TOOLS = [
           type: 'string',
           description: 'One-sentence summary of what was done.',
         },
-        reason: { type: 'string', description: 'Why this action was taken.' },
-        filesChanged: {
-          type: 'array',
-          items: { type: 'string' },
-          description: 'Workspace-relative paths of files the agent changed.',
+        suggestionCode: {
+          type: 'string',
+          description: 'Optional suggested replacement code, posted as a suggestion message.',
+        },
+        originalCode: {
+          type: 'string',
+          description:
+            'The original code the suggestion replaces (required if suggestionCode is set).',
         },
       },
-      required: ['taskId', 'content', 'agentId', 'agentName', 'summary'],
+      required: ['threadId', 'content', 'agentId', 'agentName', 'summary'],
     },
   },
   {
-    name: 'set_task_status',
-    description: 'Set a task status. Agents may set resolved or requires_review.',
+    name: 'set_thread_status',
+    description:
+      'Set a thread resolved or reopen it. Agents may mark a thread resolved once they have addressed it, or reopen to continue work.',
     inputSchema: {
       type: 'object',
       properties: {
-        taskId: { type: 'string', description: 'Task id.' },
+        threadId: { type: 'string', description: 'The thread id.' },
         status: {
           type: 'string',
-          enum: ['resolved', 'requires_review'],
-          description: 'New status.',
+          enum: ['resolved', 'open'],
+          description: 'resolved marks the thread done; open reopens it.',
         },
         reason: {
           type: 'string',
           description: 'Why the status is being changed.',
         },
+        agentId: { type: 'string', description: 'Machine identifier for this agent.' },
+        agentName: { type: 'string', description: 'Human-readable agent name.' },
       },
-      required: ['taskId', 'status'],
+      required: ['threadId', 'status'],
+    },
+  },
+  {
+    name: 'set_task_message_status',
+    description: 'Check or uncheck a task message in a thread as an AI agent.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        messageId: { type: 'string', description: 'The task message id.' },
+        completed: { type: 'boolean', description: 'true to check the task, false to uncheck it.' },
+        agentId: { type: 'string', description: 'Machine identifier for this agent.' },
+      },
+      required: ['messageId', 'completed', 'agentId'],
+    },
+  },
+  {
+    name: 'add_reaction',
+    description: 'Add an emoji reaction to a specific message in a thread as an AI agent.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        messageId: { type: 'string', description: 'The message id to react to.' },
+        emoji: { type: 'string', description: 'A single emoji, e.g. 👍 or 🚀.' },
+        agentId: { type: 'string', description: 'Machine identifier for this agent.' },
+      },
+      required: ['messageId', 'emoji', 'agentId'],
+    },
+  },
+  {
+    name: 'remove_reaction',
+    description: 'Remove this agent’s emoji reaction from a specific message.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        messageId: { type: 'string', description: 'The message id to update.' },
+        emoji: { type: 'string', description: 'The emoji reaction to remove.' },
+        agentId: { type: 'string', description: 'Machine identifier for this agent.' },
+      },
+      required: ['messageId', 'emoji', 'agentId'],
     },
   },
 ];
@@ -211,25 +409,33 @@ function handleCall(id: string | number | null, name: string, args: Record<strin
   }
 
   try {
-    if (name === 'list_open_tasks') {
-      const file = readTasks(join(storagePath, 'tasks.json'));
-      let tasks = file.tasks.filter((t) => t.status === 'open');
-      if (typeof args['filePath'] === 'string') {
-        tasks = tasks.filter((t) => t.anchor.filePath === args['filePath']);
+    if (name === 'list_open_threads') {
+      const file = readThreads(join(storagePath, 'threads.json'));
+      markOutdatedThreads(storagePath, file);
+      const msgsFile = readMessages(join(storagePath, 'messages.json'));
+      const includeOutdated = args['includeOutdated'] === true;
+      const limit = clampInteger(args['limit'], Number.MAX_SAFE_INTEGER, 1, 500);
+      let threads = file.threads.filter((t) => !t.status.resolved);
+      if (!includeOutdated) {
+        threads = threads.filter((t) => !t.status.outdated);
       }
+      if (typeof args['filePath'] === 'string') {
+        threads = threads.filter((t) => t.anchor.filePath === args['filePath']);
+      }
+      const summaries = threads.slice(0, limit).map((t) => {
+        const count = msgsFile.messages.filter((m) => m.threadId === t.id).length;
+        return threadSummary(t, count);
+      });
       ok(
         id,
         textResult(
           JSON.stringify(
-            tasks.map((t) => ({
-              id: t.id,
-              title: t.title,
-              description: t.description,
-              filePath: t.anchor.filePath,
-              line: t.anchor.line,
-              messageCount: t.messageCount,
-              updatedAt: t.updatedAt,
-            })),
+            {
+              threads: summaries,
+              totalMatching: threads.length,
+              returned: summaries.length,
+              excludedOutdatedByDefault: !includeOutdated,
+            },
             null,
             2,
           ),
@@ -238,147 +444,441 @@ function handleCall(id: string | number | null, name: string, args: Record<strin
       return;
     }
 
-    if (name === 'get_task_thread') {
-      const taskId = args['taskId'];
-      if (typeof taskId !== 'string') {
-        fail(id, -32602, 'taskId is required');
+    if (name === 'get_thread') {
+      const threadId = args['threadId'];
+      if (typeof threadId !== 'string') {
+        fail(id, -32602, 'threadId is required');
         return;
       }
-      const tasksFile = readTasks(join(storagePath, 'tasks.json'));
-      const task = tasksFile.tasks.find((t) => t.id === taskId);
-      if (task == null) {
-        fail(id, -32602, `Task ${taskId} not found`);
+      const threadsFile = readThreads(join(storagePath, 'threads.json'));
+      markOutdatedThreads(storagePath, threadsFile);
+      const thread = findThread(threadsFile, threadId);
+      if (thread == null) {
+        fail(id, -32602, `Thread ${threadId} not found`);
+        return;
+      }
+      if (thread.status.outdated && args['includeOutdated'] !== true) {
+        fail(
+          id,
+          -32602,
+          `Thread ${threadId} is outdated because its anchor line changed. Use includeOutdated=true only to inspect stale comments, not to act on them.`,
+        );
         return;
       }
       const msgsFile = readMessages(join(storagePath, 'messages.json'));
-      const messages = msgsFile.messages
-        .filter((m) => m.taskId === taskId)
-        .sort((a, b) => a.seq - b.seq);
-      ok(id, textResult(JSON.stringify({ task, messages }, null, 2)));
+      const allMessages = sortedThreadMessages(msgsFile, threadId);
+      const messageLimit = clampInteger(args['messageLimit'], allMessages.length, 1, 500);
+      const messages = allMessages.slice(-messageLimit);
+      ok(
+        id,
+        textResult(
+          JSON.stringify(
+            {
+              thread,
+              messages,
+              totalMessages: allMessages.length,
+              returnedMessages: messages.length,
+            },
+            null,
+            2,
+          ),
+        ),
+      );
+      return;
+    }
+
+    if (name === 'get_message') {
+      const messageId = args['messageId'];
+      if (typeof messageId !== 'string') {
+        fail(id, -32602, 'messageId is required');
+        return;
+      }
+      const threadsFile = readThreads(join(storagePath, 'threads.json'));
+      markOutdatedThreads(storagePath, threadsFile);
+      const msgsFile = readMessages(join(storagePath, 'messages.json'));
+      const located = findMessage(msgsFile, messageId);
+      if (located == null) {
+        fail(id, -32602, `Message ${messageId} not found`);
+        return;
+      }
+      const thread = findThread(threadsFile, located.message.threadId);
+      if (thread == null) {
+        fail(id, -32602, `Thread ${located.message.threadId} not found`);
+        return;
+      }
+      if (thread.status.outdated && args['includeOutdated'] !== true) {
+        fail(
+          id,
+          -32602,
+          `Thread ${thread.id} is outdated because its anchor line changed. Use includeOutdated=true only to inspect stale comments, not to act on them.`,
+        );
+        return;
+      }
+      const threadMessages = sortedThreadMessages(msgsFile, located.message.threadId);
+      const position = threadMessages.findIndex((m) => m.id === messageId);
+      ok(
+        id,
+        textResult(
+          JSON.stringify(
+            {
+              thread: threadSummary(thread, threadMessages.length),
+              message: located.message,
+              position,
+              totalMessages: threadMessages.length,
+            },
+            null,
+            2,
+          ),
+        ),
+      );
+      return;
+    }
+
+    if (name === 'get_message_context') {
+      const messageId = args['messageId'];
+      if (typeof messageId !== 'string') {
+        fail(id, -32602, 'messageId is required');
+        return;
+      }
+      const threadsFile = readThreads(join(storagePath, 'threads.json'));
+      markOutdatedThreads(storagePath, threadsFile);
+      const msgsFile = readMessages(join(storagePath, 'messages.json'));
+      const located = findMessage(msgsFile, messageId);
+      if (located == null) {
+        fail(id, -32602, `Message ${messageId} not found`);
+        return;
+      }
+      const thread = findThread(threadsFile, located.message.threadId);
+      if (thread == null) {
+        fail(id, -32602, `Thread ${located.message.threadId} not found`);
+        return;
+      }
+      if (thread.status.outdated && args['includeOutdated'] !== true) {
+        fail(
+          id,
+          -32602,
+          `Thread ${thread.id} is outdated because its anchor line changed. Use includeOutdated=true only to inspect stale comments, not to act on them.`,
+        );
+        return;
+      }
+      const before = clampInteger(args['before'], 5, 0, 100);
+      const after = clampInteger(args['after'], 0, 0, 100);
+      const threadMessages = sortedThreadMessages(msgsFile, located.message.threadId);
+      const center = threadMessages.findIndex((m) => m.id === messageId);
+      const start = Math.max(0, center - before);
+      const end = Math.min(threadMessages.length, center + after + 1);
+      ok(
+        id,
+        textResult(
+          JSON.stringify(
+            {
+              thread: threadSummary(thread, threadMessages.length),
+              targetMessageId: messageId,
+              targetIndex: center,
+              range: { start, endExclusive: end },
+              messages: threadMessages.slice(start, end).map(messageSummary),
+              totalMessages: threadMessages.length,
+            },
+            null,
+            2,
+          ),
+        ),
+      );
       return;
     }
 
     if (name === 'post_agent_reply') {
-      const { taskId, content, agentId, agentName, summary, reason, filesChanged } = args;
+      const {
+        threadId,
+        replyToMessageId,
+        content,
+        agentId,
+        agentName,
+        summary,
+        suggestionCode,
+        originalCode,
+      } = args;
       if (
-        typeof taskId !== 'string' ||
+        typeof threadId !== 'string' ||
         typeof content !== 'string' ||
         typeof agentId !== 'string' ||
         typeof agentName !== 'string' ||
         typeof summary !== 'string'
       ) {
-        fail(id, -32602, 'taskId, content, agentId, agentName, summary are required');
+        fail(id, -32602, 'threadId, content, agentId, agentName, summary are required');
         return;
       }
 
-      const tasksFile = readTasks(join(storagePath, 'tasks.json'));
-      const taskIdx = tasksFile.tasks.findIndex((t) => t.id === taskId);
-      if (taskIdx === -1) {
-        fail(id, -32602, `Task ${taskId} not found`);
+      const threadsFile = readThreads(join(storagePath, 'threads.json'));
+      markOutdatedThreads(storagePath, threadsFile);
+      const threadIdx = threadsFile.threads.findIndex((t) => t.id === threadId);
+      if (threadIdx === -1) {
+        fail(id, -32602, `Thread ${threadId} not found`);
         return;
       }
-      const task = tasksFile.tasks[taskIdx];
+      const thread = threadsFile.threads[threadIdx];
+
+      // Enforce: resolved and outdated threads are locked from agent replies.
+      if (thread.status.resolved) {
+        fail(id, -32602, `Thread ${threadId} is resolved. Reopen it with set_thread_status first.`);
+        return;
+      }
+      if (thread.status.outdated) {
+        fail(
+          id,
+          -32602,
+          `Thread ${threadId} is outdated because its anchor line changed. Ask the user to refresh or recreate the comment before replying.`,
+        );
+        return;
+      }
 
       const msgsFile = readMessages(join(storagePath, 'messages.json'));
-      const taskMessages = msgsFile.messages.filter((m) => m.taskId === taskId);
-      const seq = taskMessages.reduce((max, m) => Math.max(max, m.seq), 0) + 1;
-      const parentId = task.threadTail.length > 0 ? task.threadTail : null;
+      if (typeof replyToMessageId === 'string') {
+        const replyTarget = msgsFile.messages.find(
+          (m) => m.id === replyToMessageId && m.threadId === threadId,
+        );
+        if (replyTarget == null) {
+          fail(id, -32602, `Reply target ${replyToMessageId} not found in thread ${threadId}`);
+          return;
+        }
+      }
+
+      const author: Author = { type: 'ai', id: agentId, name: agentName };
       const now = new Date().toISOString();
       const messageId = `msg_${randomUUID()}`;
+      const suggestionText =
+        typeof suggestionCode === 'string' && suggestionCode.length > 0 ? suggestionCode : null;
+      const hasSuggestion = suggestionText != null;
 
-      const message: TaskMessage = {
+      const message: ReviewMessage = {
         id: messageId,
-        taskId,
-        parentId,
-        seq,
-        authorType: 'ai',
-        author: agentName,
-        content,
-        messageType: 'comment',
-        suggestionCode: '',
-        timestamp: now,
+        threadId,
+        author,
+        type: hasSuggestion ? 'suggestion' : 'comment',
+        content: { markdown: appendReplyPrefix(content, replyToMessageId) },
+        suggestion: hasSuggestion
+          ? {
+              originalCode: typeof originalCode === 'string' ? originalCode : '',
+              suggestedCode: suggestionText,
+              applied: false,
+              appliedBy: null,
+              appliedAt: null,
+            }
+          : null,
+        task: null,
+        reactions: {},
+        metadata: { createdAt: now, updatedAt: now, editedAt: null },
       };
 
       msgsFile.messages.push(message);
       writeJson(join(storagePath, 'messages.json'), msgsFile);
 
-      tasksFile.tasks[taskIdx] = {
-        ...task,
-        threadTail: messageId,
-        messageCount: task.messageCount + 1,
-        updatedAt: now,
+      threadsFile.threads[threadIdx] = {
+        ...thread,
+        metadata: { ...thread.metadata, updatedAt: now },
       };
-      writeJson(join(storagePath, 'tasks.json'), tasksFile);
+      writeJson(join(storagePath, 'threads.json'), threadsFile);
 
-      const execution: AgentExecution = {
-        id: `exec_${randomUUID()}`,
-        messageId,
-        taskId,
-        agentId,
-        agentName,
-        timestamp: now,
-        summary,
-        reason: typeof reason === 'string' ? reason : null,
-        filesChanged: Array.isArray(filesChanged) ? filesChanged.map(String) : null,
-      };
-
-      const execFile = readExecutions(join(storagePath, 'executions.json'));
-      execFile.executions.push(execution);
-      writeJson(join(storagePath, 'executions.json'), execFile);
-
-      ok(id, textResult(JSON.stringify({ messageId, executionId: execution.id }, null, 2)));
+      ok(
+        id,
+        textResult(JSON.stringify({ messageId, threadId, summary, type: message.type }, null, 2)),
+      );
       return;
     }
 
-    if (name === 'set_task_status') {
-      const taskId = args['taskId'];
+    if (name === 'set_thread_status') {
+      const threadId = args['threadId'];
       const status = args['status'];
-      if (typeof taskId !== 'string' || typeof status !== 'string') {
-        fail(id, -32602, 'taskId and status are required');
+      if (typeof threadId !== 'string' || typeof status !== 'string') {
+        fail(id, -32602, 'threadId and status are required');
         return;
       }
-      const ALLOWED_STATUSES = ['resolved', 'requires_review'] as const;
-      const allowed = ALLOWED_STATUSES.find((s) => s === status);
-      if (allowed == null) {
-        fail(id, -32602, 'Agents may only set resolved or requires_review');
+      const isResolved = status === 'resolved';
+      const isOpen = status === 'open';
+      if (!isResolved && !isOpen) {
+        fail(id, -32602, 'status must be resolved or open');
         return;
       }
 
-      const tasksFile = readTasks(join(storagePath, 'tasks.json'));
-      const taskIdx = tasksFile.tasks.findIndex((t) => t.id === taskId);
-      if (taskIdx === -1) {
-        fail(id, -32602, `Task ${taskId} not found`);
+      const threadsFile = readThreads(join(storagePath, 'threads.json'));
+      markOutdatedThreads(storagePath, threadsFile);
+      const threadIdx = threadsFile.threads.findIndex((t) => t.id === threadId);
+      if (threadIdx === -1) {
+        fail(id, -32602, `Thread ${threadId} not found`);
         return;
       }
 
       const now = new Date().toISOString();
-      tasksFile.tasks[taskIdx] = {
-        ...tasksFile.tasks[taskIdx],
-        status: allowed,
-        updatedAt: now,
-      };
-      writeJson(join(storagePath, 'tasks.json'), tasksFile);
-
-      const histFile = readHistory(join(storagePath, 'history.json'));
-      const taskEvents = histFile.events.filter((e) => e.taskId === taskId);
-      const seq = taskEvents.reduce((max, e) => Math.max(max, e.seq), 0) + 1;
       const actor =
         typeof args['agentId'] === 'string'
           ? args['agentId']
           : typeof args['agentName'] === 'string'
             ? args['agentName']
             : 'agent';
-      histFile.events.push({
-        id: `evt_${randomUUID()}`,
-        taskId,
-        seq,
-        type: `status_${status}`,
-        actor,
-        timestamp: now,
-      });
-      writeJson(join(storagePath, 'history.json'), histFile);
+      const reason = typeof args['reason'] === 'string' ? args['reason'] : null;
 
-      ok(id, textResult(JSON.stringify({ taskId, status }, null, 2)));
+      threadsFile.threads[threadIdx] = {
+        ...threadsFile.threads[threadIdx],
+        status: isResolved
+          ? {
+              ...threadsFile.threads[threadIdx].status,
+              resolved: true,
+              resolvedBy: actor,
+              resolvedAt: now,
+            }
+          : {
+              ...threadsFile.threads[threadIdx].status,
+              resolved: false,
+              resolvedBy: null,
+              resolvedAt: null,
+            },
+        metadata: { ...threadsFile.threads[threadIdx].metadata, updatedAt: now },
+      };
+      writeJson(join(storagePath, 'threads.json'), threadsFile);
+
+      ok(id, textResult(JSON.stringify({ threadId, status, reason }, null, 2)));
+      return;
+    }
+
+    if (name === 'set_task_message_status') {
+      const { messageId, completed, agentId } = args;
+      if (
+        typeof messageId !== 'string' ||
+        typeof completed !== 'boolean' ||
+        typeof agentId !== 'string'
+      ) {
+        fail(id, -32602, 'messageId, completed, agentId are required');
+        return;
+      }
+      const threadsFile = readThreads(join(storagePath, 'threads.json'));
+      markOutdatedThreads(storagePath, threadsFile);
+      const msgsFile = readMessages(join(storagePath, 'messages.json'));
+      const located = findMessage(msgsFile, messageId);
+      if (located == null) {
+        fail(id, -32602, `Message ${messageId} not found`);
+        return;
+      }
+      const thread = findThread(threadsFile, located.message.threadId);
+      if (thread?.status.outdated) {
+        fail(
+          id,
+          -32602,
+          `Thread ${located.message.threadId} is outdated; task state was not changed.`,
+        );
+        return;
+      }
+      if (located.message.task == null) {
+        fail(id, -32602, `Message ${messageId} is not a task message`);
+        return;
+      }
+      const now = new Date().toISOString();
+      msgsFile.messages[located.index] = {
+        ...located.message,
+        task: {
+          ...located.message.task,
+          completed,
+          completedBy: completed ? agentId : null,
+          completedAt: completed ? now : null,
+        },
+        metadata: { ...located.message.metadata, updatedAt: now },
+      };
+      writeJson(join(storagePath, 'messages.json'), msgsFile);
+
+      const threadIdx = threadsFile.threads.findIndex((t) => t.id === located.message.threadId);
+      if (threadIdx !== -1) {
+        threadsFile.threads[threadIdx] = {
+          ...threadsFile.threads[threadIdx],
+          metadata: { ...threadsFile.threads[threadIdx].metadata, updatedAt: now },
+        };
+        writeJson(join(storagePath, 'threads.json'), threadsFile);
+      }
+
+      ok(id, textResult(JSON.stringify({ messageId, completed, by: agentId }, null, 2)));
+      return;
+    }
+
+    if (name === 'add_reaction') {
+      const { messageId, emoji, agentId } = args;
+      if (
+        typeof messageId !== 'string' ||
+        typeof emoji !== 'string' ||
+        typeof agentId !== 'string'
+      ) {
+        fail(id, -32602, 'messageId, emoji, agentId are required');
+        return;
+      }
+      const threadsFile = readThreads(join(storagePath, 'threads.json'));
+      markOutdatedThreads(storagePath, threadsFile);
+      const msgsFile = readMessages(join(storagePath, 'messages.json'));
+      const located = findMessage(msgsFile, messageId);
+      if (located == null) {
+        fail(id, -32602, `Message ${messageId} not found`);
+        return;
+      }
+      const thread = findThread(threadsFile, located.message.threadId);
+      if (thread?.status.outdated) {
+        fail(id, -32602, `Thread ${located.message.threadId} is outdated; reaction was not added.`);
+        return;
+      }
+      const reactions = { ...located.message.reactions };
+      const reactors = new Set(reactions[emoji] ?? []);
+      reactors.add(agentId);
+      reactions[emoji] = [...reactors];
+      const now = new Date().toISOString();
+      msgsFile.messages[located.index] = {
+        ...located.message,
+        reactions,
+        metadata: { ...located.message.metadata, updatedAt: now },
+      };
+      writeJson(join(storagePath, 'messages.json'), msgsFile);
+
+      ok(id, textResult(JSON.stringify({ messageId, emoji, by: agentId }, null, 2)));
+      return;
+    }
+
+    if (name === 'remove_reaction') {
+      const { messageId, emoji, agentId } = args;
+      if (
+        typeof messageId !== 'string' ||
+        typeof emoji !== 'string' ||
+        typeof agentId !== 'string'
+      ) {
+        fail(id, -32602, 'messageId, emoji, agentId are required');
+        return;
+      }
+      const threadsFile = readThreads(join(storagePath, 'threads.json'));
+      markOutdatedThreads(storagePath, threadsFile);
+      const msgsFile = readMessages(join(storagePath, 'messages.json'));
+      const located = findMessage(msgsFile, messageId);
+      if (located == null) {
+        fail(id, -32602, `Message ${messageId} not found`);
+        return;
+      }
+      const thread = findThread(threadsFile, located.message.threadId);
+      if (thread?.status.outdated) {
+        fail(
+          id,
+          -32602,
+          `Thread ${located.message.threadId} is outdated; reaction was not removed.`,
+        );
+        return;
+      }
+      const reactions = { ...located.message.reactions };
+      const reactors = (reactions[emoji] ?? []).filter((reactor) => reactor !== agentId);
+      if (reactors.length === 0) {
+        delete reactions[emoji];
+      } else {
+        reactions[emoji] = reactors;
+      }
+      const now = new Date().toISOString();
+      msgsFile.messages[located.index] = {
+        ...located.message,
+        reactions,
+        metadata: { ...located.message.metadata, updatedAt: now },
+      };
+      writeJson(join(storagePath, 'messages.json'), msgsFile);
+
+      ok(id, textResult(JSON.stringify({ messageId, emoji, removedBy: agentId }, null, 2)));
       return;
     }
 

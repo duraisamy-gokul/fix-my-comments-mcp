@@ -1,12 +1,8 @@
 import {
-  type Task,
-  decodeTask,
-  type TaskMessage,
-  decodeTaskMessage,
-  type TaskHistoryEvent,
-  decodeTaskHistoryEvent,
-  type AgentExecution,
-  decodeAgentExecution,
+  type ReviewThread,
+  decodeReviewThread,
+  type ReviewMessage,
+  decodeReviewMessage,
 } from './Task';
 import {
   isJSON,
@@ -64,64 +60,64 @@ export function decodeWorkspaceIdentity(rawInput: unknown): WorkspaceIdentity | 
 }
 
 /**
- * @type { TaskFile }
- * @description Root shape of the tasks.json storage file
+ * @type { ThreadFile }
+ * @description Root shape of the threads.json storage file
  */
-export type TaskFile = {
+export type ThreadFile = {
   /**
    * @description Storage schema version
    * @type { number }
-   * @memberof TaskFile
+   * @memberof ThreadFile
    */
   schemaVersion: number;
   /**
-   * @description All tasks for this workspace and branch
-   * @type { Task[] }
-   * @memberof TaskFile
+   * @description All review threads for this workspace and branch
+   * @type { ReviewThread[] }
+   * @memberof ThreadFile
    */
-  tasks: Task[];
+  threads: ReviewThread[];
 };
 
-export function decodeTaskFile(rawInput: unknown): TaskFile | null {
+export function decodeThreadFile(rawInput: unknown): ThreadFile | null {
   if (isJSON(rawInput)) {
     const decodedSchemaVersion = decodeNumber(rawInput['schemaVersion']);
-    const decodedTasks = decodeArray(rawInput['tasks'], decodeTask);
+    const decodedThreads = decodeArray(rawInput['threads'], decodeReviewThread);
 
-    if (decodedSchemaVersion === null || decodedTasks === null) {
+    if (decodedSchemaVersion === null || decodedThreads === null) {
       return null;
     }
 
     return {
       schemaVersion: decodedSchemaVersion,
-      tasks: decodedTasks,
+      threads: decodedThreads,
     };
   }
   return null;
 }
 
 /**
- * @type { MessageFile }
+ * @type { ReviewMessageFile }
  * @description Root shape of the messages.json storage file
  */
-export type MessageFile = {
+export type ReviewMessageFile = {
   /**
    * @description Storage schema version
    * @type { number }
-   * @memberof MessageFile
+   * @memberof ReviewMessageFile
    */
   schemaVersion: number;
   /**
-   * @description All thread messages across tasks for this workspace and branch
-   * @type { TaskMessage[] }
-   * @memberof MessageFile
+   * @description All thread messages across threads for this workspace and branch
+   * @type { ReviewMessage[] }
+   * @memberof ReviewMessageFile
    */
-  messages: TaskMessage[];
+  messages: ReviewMessage[];
 };
 
-export function decodeMessageFile(rawInput: unknown): MessageFile | null {
+export function decodeReviewMessageFile(rawInput: unknown): ReviewMessageFile | null {
   if (isJSON(rawInput)) {
     const decodedSchemaVersion = decodeNumber(rawInput['schemaVersion']);
-    const decodedMessages = decodeArray(rawInput['messages'], decodeTaskMessage);
+    const decodedMessages = decodeArray(rawInput['messages'], decodeReviewMessage);
 
     if (decodedSchemaVersion === null || decodedMessages === null) {
       return null;
@@ -130,78 +126,6 @@ export function decodeMessageFile(rawInput: unknown): MessageFile | null {
     return {
       schemaVersion: decodedSchemaVersion,
       messages: decodedMessages,
-    };
-  }
-  return null;
-}
-
-/**
- * @type { HistoryFile }
- * @description Root shape of the history.json storage file
- */
-export type HistoryFile = {
-  /**
-   * @description Storage schema version
-   * @type { number }
-   * @memberof HistoryFile
-   */
-  schemaVersion: number;
-  /**
-   * @description All history events across tasks for this workspace and branch
-   * @type { TaskHistoryEvent[] }
-   * @memberof HistoryFile
-   */
-  events: TaskHistoryEvent[];
-};
-
-export function decodeHistoryFile(rawInput: unknown): HistoryFile | null {
-  if (isJSON(rawInput)) {
-    const decodedSchemaVersion = decodeNumber(rawInput['schemaVersion']);
-    const decodedEvents = decodeArray(rawInput['events'], decodeTaskHistoryEvent);
-
-    if (decodedSchemaVersion === null || decodedEvents === null) {
-      return null;
-    }
-
-    return {
-      schemaVersion: decodedSchemaVersion,
-      events: decodedEvents,
-    };
-  }
-  return null;
-}
-
-/**
- * @type { ExecutionFile }
- * @description Root shape of the executions.json storage file
- */
-export type ExecutionFile = {
-  /**
-   * @description Storage schema version
-   * @type { number }
-   * @memberof ExecutionFile
-   */
-  schemaVersion: number;
-  /**
-   * @description All agent execution records for this workspace and branch
-   * @type { AgentExecution[] }
-   * @memberof ExecutionFile
-   */
-  executions: AgentExecution[];
-};
-
-export function decodeExecutionFile(rawInput: unknown): ExecutionFile | null {
-  if (isJSON(rawInput)) {
-    const decodedSchemaVersion = decodeNumber(rawInput['schemaVersion']);
-    const decodedExecutions = decodeArray(rawInput['executions'], decodeAgentExecution);
-
-    if (decodedSchemaVersion === null || decodedExecutions === null) {
-      return null;
-    }
-
-    return {
-      schemaVersion: decodedSchemaVersion,
-      executions: decodedExecutions,
     };
   }
   return null;

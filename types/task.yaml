@@ -1,190 +1,50 @@
 Task:
-  TaskStatus:
-    description: Lifecycle state of a task
+  AnchorType:
+    description: Where a thread is anchored — a single line or the whole file
     type: string
     enum:
-      - open
-      - in_progress
-      - resolved
-      - blocked
-      - requires_review
-      - orphaned
-      - outdated
-      - closed
-
-  TaskScope:
-    description: What a task is attached to
-    type: string
-    enum:
-      - selection
+      - line
       - file
-      - repo
 
   AuthorType:
-    description: Origin of a message
+    description: Origin of a message author
     type: string
     enum:
       - user
       - ai
-      - system
 
-  CodeAnchor:
-    description: Location a task is anchored to — a single line in a file
-    type: object
-    required: [filePath, line, lineHash]
-    properties:
-      filePath:
-        description: Workspace-relative file path
-        type: string
-      line:
-        description: Zero-based line number the comment is attached to (followed as lines shift)
-        type: number
-      lineHash:
-        description: SHA-256 hex digest (first 16 chars) of the commented line's text; mismatch marks the comment outdated
-        type: string
+  MessageType:
+    description: Kind of message in a thread — comment, task (checkbox), or suggestion (diff-style code change)
+    type: string
+    enum:
+      - comment
+      - task
+      - suggestion
 
-  TaskMessage:
-    description: A single entry in a task thread (append-only log)
+  ThreadStatus:
+    description: Lifecycle flags for a thread — resolved and outdated are independent
     type: object
-    required: [id, taskId, seq, authorType, author, content, messageType, suggestionCode, timestamp]
+    required: [resolved, outdated]
     properties:
-      id:
-        description: Message identifier
+      resolved:
+        description: Whether the thread has been marked resolved (checkbox)
+        type: boolean
+      outdated:
+        description: Whether the anchored line's content has drifted (hash mismatch)
+        type: boolean
+      resolvedBy:
+        description: Who resolved the thread (user or agent id/name)
         type: string
-      taskId:
-        description: Owning task identifier
-        type: string
-      parentId:
-        description: Message being replied to (null for the root message)
-        type: string
-      seq:
-        description: Monotonic per-task order
-        type: number
-      authorType:
-        $ref: './types/task.yaml#/Task/AuthorType'
-      author:
-        description: Display name of the author
-        type: string
-      content:
-        description: Message body
-        type: string
-      messageType:
-        description: Kind of message — comment (default) or suggestion (diff-style code change); null treated as comment
-        type: string
-        enum:
-          - comment
-          - suggestion
-        nullable: true
-      suggestionCode:
-        description: Proposed replacement code when messageType is suggestion; null for plain comments
-        type: string
-        nullable: true
-      timestamp:
-        description: ISO timestamp
+      resolvedAt:
+        description: ISO timestamp the thread was resolved
         type: string
         format: date-time
 
-  TaskHistoryEvent:
-    description: A single entry in a task history log (append-only)
+  ThreadMetadata:
+    description: Timestamps for a thread
     type: object
-    required: [id, taskId, seq, type, actor, timestamp]
+    required: [createdAt, updatedAt]
     properties:
-      id:
-        description: Event identifier
-        type: string
-      taskId:
-        description: Owning task identifier
-        type: string
-      seq:
-        description: Monotonic per-task order
-        type: number
-      type:
-        description: Event type (e.g. created, status_changed)
-        type: string
-      actor:
-        description: Who caused the event
-        type: string
-      timestamp:
-        description: ISO timestamp
-        type: string
-        format: date-time
-
-  AgentExecution:
-    description: Metadata from an AI agent execution linked to a thread message
-    type: object
-    required: [id, messageId, taskId, agentId, agentName, timestamp, summary]
-    properties:
-      id:
-        description: Unique execution identifier
-        type: string
-      messageId:
-        description: Message this execution is linked to
-        type: string
-      taskId:
-        description: Task this execution is linked to
-        type: string
-      agentId:
-        description: Machine identifier for the agent (e.g. claude-code)
-        type: string
-      agentName:
-        description: Human-readable agent name
-        type: string
-      timestamp:
-        description: ISO timestamp of execution
-        type: string
-        format: date-time
-      summary:
-        description: One-sentence summary of what the agent did
-        type: string
-      reason:
-        description: Why the agent performed this action
-        type: string
-      filesChanged:
-        description: Workspace-relative paths of files the agent changed
-        type: array
-        items:
-          type: string
-
-  Task:
-    description: A code-anchored task (lightweight record; thread/history stored separately)
-    type: object
-    required:
-      [
-        id,
-        schemaVersion,
-        title,
-        description,
-        scope,
-        status,
-        createdBy,
-        createdAt,
-        updatedAt,
-        anchor,
-        labels,
-        threadHead,
-        threadTail,
-        messageCount,
-      ]
-    properties:
-      id:
-        description: Task identifier
-        type: string
-      schemaVersion:
-        description: Schema version for forward migration
-        type: number
-      title:
-        description: Short task title
-        type: string
-      description:
-        description: Task description
-        type: string
-      scope:
-        $ref: './types/task.yaml#/Task/TaskScope'
-      status:
-        $ref: './types/task.yaml#/Task/TaskStatus'
-      createdBy:
-        description: Who created the task
-        type: string
       createdAt:
         description: ISO creation timestamp
         type: string
@@ -193,19 +53,155 @@ Task:
         description: ISO last-update timestamp
         type: string
         format: date-time
-      anchor:
-        $ref: './types/task.yaml#/Task/CodeAnchor'
-      labels:
-        description: Freeform labels
+
+  ThreadAnchor:
+    description: Location a thread is anchored to — a single line or a whole file
+    type: object
+    required: [type, filePath, lineHash]
+    properties:
+      type:
+        $ref: './types/task.yaml#/Task/AnchorType'
+      filePath:
+        description: Workspace-relative file path
+        type: string
+      line:
+        description: Zero-based line number the thread is attached to (followed as lines shift); null for file-level threads
+        type: number
+      lineHash:
+        description: SHA-256 hex digest (first 16 chars) of the anchored line's text; mismatch marks the thread outdated
+        type: string
+      snippet:
+        description: The anchored line's text at creation time, for display when the line has drifted
+        type: string
+
+  Author:
+    description: Author of a message — a user or an AI agent
+    type: object
+    required: [type, id, name]
+    properties:
+      type:
+        $ref: './types/task.yaml#/Task/AuthorType'
+      id:
+        description: Stable identifier for the author (e.g. user id, or agent machine id like claude-code)
+        type: string
+      name:
+        description: Human-readable display name
+        type: string
+
+  MessageContent:
+    description: The markdown body of a message
+    type: object
+    required: [markdown]
+    properties:
+      markdown:
+        description: Raw markdown content (links, inline code, formatting)
+        type: string
+
+  Suggestion:
+    description: A diff-style code suggestion attached to a message
+    type: object
+    required: [originalCode, suggestedCode, applied]
+    properties:
+      originalCode:
+        description: The code the suggestion replaces
+        type: string
+      suggestedCode:
+        description: The proposed replacement code
+        type: string
+      applied:
+        description: Whether the suggestion has been applied to the file
+        type: boolean
+      appliedBy:
+        description: Who applied the suggestion
+        type: string
+      appliedAt:
+        description: ISO timestamp the suggestion was applied
+        type: string
+        format: date-time
+
+  TaskState:
+    description: Checkbox state for a task message
+    type: object
+    required: [completed]
+    properties:
+      completed:
+        description: Whether the task is checked off
+        type: boolean
+      completedBy:
+        description: Who completed the task
+        type: string
+      completedAt:
+        description: ISO timestamp the task was completed
+        type: string
+        format: date-time
+
+  Reactions:
+    description: Emoji -> list of author ids who reacted
+    type: object
+    additionalProperties:
+      keyType: string
+      valueType:
         type: array
         items:
           type: string
-      threadHead:
-        description: First message id in the thread
+
+  MessageMetadata:
+    description: Timestamps for a message
+    type: object
+    required: [createdAt, updatedAt]
+    properties:
+      createdAt:
+        description: ISO creation timestamp
         type: string
-      threadTail:
-        description: Newest message id in the thread
+        format: date-time
+      updatedAt:
+        description: ISO last-update timestamp
         type: string
-      messageCount:
-        description: Number of messages in the thread
-        type: number
+        format: date-time
+      editedAt:
+        description: ISO timestamp of the last edit, if edited
+        type: string
+        format: date-time
+
+  ReviewThread:
+    description: A code-anchored review thread (Bitbucket-style); owns its anchor and resolve/outdated state
+    type: object
+    required: [id, anchor, status, metadata]
+    properties:
+      id:
+        description: Thread identifier
+        type: string
+      anchor:
+        $ref: './types/task.yaml#/Task/ThreadAnchor'
+      status:
+        $ref: './types/task.yaml#/Task/ThreadStatus'
+      metadata:
+        $ref: './types/task.yaml#/Task/ThreadMetadata'
+
+  ReviewMessage:
+    description: A single flat message in a review thread (append-only log; no nested replies)
+    type: object
+    required: [id, threadId, author, type, content, reactions, metadata]
+    properties:
+      id:
+        description: Message identifier
+        type: string
+      threadId:
+        description: Owning thread identifier
+        type: string
+      author:
+        $ref: './types/task.yaml#/Task/Author'
+      type:
+        $ref: './types/task.yaml#/Task/MessageType'
+      content:
+        $ref: './types/task.yaml#/Task/MessageContent'
+      suggestion:
+        description: Present when type is suggestion
+        $ref: './types/task.yaml#/Task/Suggestion'
+      task:
+        description: Present when type is task
+        $ref: './types/task.yaml#/Task/TaskState'
+      reactions:
+        $ref: './types/task.yaml#/Task/Reactions'
+      metadata:
+        $ref: './types/task.yaml#/Task/MessageMetadata'

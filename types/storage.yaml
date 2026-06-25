@@ -16,21 +16,21 @@ Storage:
           lives. Shared verbatim with the fix-my-comments-mcp server.
         type: string
 
-  TaskFile:
-    description: Root shape of the tasks.json storage file
+  ThreadFile:
+    description: Root shape of the threads.json storage file
     type: object
-    required: [schemaVersion, tasks]
+    required: [schemaVersion, threads]
     properties:
       schemaVersion:
         description: Storage schema version
         type: number
-      tasks:
-        description: All tasks for this workspace and branch
+      threads:
+        description: All review threads for this workspace and branch
         type: array
         items:
-          $ref: './types/task.yaml#/Task/Task'
+          $ref: './types/task.yaml#/Task/ReviewThread'
 
-  MessageFile:
+  ReviewMessageFile:
     description: Root shape of the messages.json storage file
     type: object
     required: [schemaVersion, messages]
@@ -39,35 +39,7 @@ Storage:
         description: Storage schema version
         type: number
       messages:
-        description: All thread messages across tasks for this workspace and branch
+        description: All thread messages across threads for this workspace and branch
         type: array
         items:
-          $ref: './types/task.yaml#/Task/TaskMessage'
-
-  HistoryFile:
-    description: Root shape of the history.json storage file
-    type: object
-    required: [schemaVersion, events]
-    properties:
-      schemaVersion:
-        description: Storage schema version
-        type: number
-      events:
-        description: All history events across tasks for this workspace and branch
-        type: array
-        items:
-          $ref: './types/task.yaml#/Task/TaskHistoryEvent'
-
-  ExecutionFile:
-    description: Root shape of the executions.json storage file
-    type: object
-    required: [schemaVersion, executions]
-    properties:
-      schemaVersion:
-        description: Storage schema version
-        type: number
-      executions:
-        description: All agent execution records for this workspace and branch
-        type: array
-        items:
-          $ref: './types/task.yaml#/Task/AgentExecution'
+          $ref: './types/task.yaml#/Task/ReviewMessage'
